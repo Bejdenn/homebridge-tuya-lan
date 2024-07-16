@@ -1,46 +1,45 @@
 #!/usr/bin/env node
 
-const Proxy = require('http-mitm-proxy');
-const EventEmitter = require('events');
-const program = require('commander');
-const QRCode = require('qrcode');
-const path = require('path');
-const os = require('os');
-const JSON5 = require('json5');
-const fs = require('fs-extra');
+import { Proxy } from 'http-mitm-proxy';
+import EventEmitter from 'events';
+import { Command } from 'commander';
+import QRCode from 'qrcode';
+import { resolve, join } from 'path';
+import { networkInterfaces } from 'os';
+import JSON5 from 'json5';
+import { statSync, readFileSync } from 'fs';
 
 // Disable debug messages from the proxy
 try {
     require('debug').disable();
-} catch(ex) {}
+} catch (ex) { }
 
-const ROOT = path.resolve(__dirname);
+const ROOT = resolve(import.meta.dirname);
 
-const pemFile = path.join(ROOT, 'certs', 'ca.pem');
+const pemFile = join(ROOT, 'certs', 'ca.pem');
 
-let localIPs = [];
-const ifaces = os.networkInterfaces();
-Object.keys(ifaces).forEach(name => {
-    ifaces[name].forEach(network => {
-        if (network.family === 'IPv4' && !network.internal) localIPs.push(network.address);
-    });
-});
+let localIPs = Object.values(networkInterfaces()).flatMap(networks =>
+    networks?.filter(network => network.family === 'IPv4').filter(network => !network.internal).map(network => network.address) || []
+);
 
-const proxy = Proxy();
+const proxy = new Proxy();
 const emitter = new EventEmitter();
 
-program
-    .name('tuya-lan find')
+const program = new Command();
+
+program.name('tuya-lan find')
     .option('--ip <ip>', 'IP address to listen for requests')
-    .option('-p, --port <port>', 'port the proxy should listen on', 8080)
+    .option('-p, --port <port>', 'port the proxy should listen on', 9567)
     .option('--schema', 'include schema in the output')
-    .parse(process.argv);
 
+program.parse();
 
-if (program.ip) {
-    if (localIPs.includes(program.ip)) localIPs = [program.ip];
+const options = program.opts();
+
+if (options.ip) {
+    if (localIPs.includes(options.ip)) localIPs = [options.ip];
     else {
-        console.log(`The requested IP, ${program.ip}, is not a valid external IPv4 address. The valid options are:\n\t${localIPs.join('\n\t')}`);
+        console.log(`The requested IP, ${options.ip}, is not a valid external IPv4 address. The valid options are:\n\t${localIPs.join('\n\t')}`);
         process.exit();
     }
 }
@@ -48,11 +47,11 @@ if (localIPs.length > 1) {
     console.log(`You have multiple network interfaces: ${localIPs.join(', ')}\nChoose one by passing it with the --ip parameter.\n\nExample: tuya-lan-find --ip ${localIPs[0]}`);
     process.exit();
 }
-const localIPPorts = localIPs.map(ip => `${ip}:${program.port}`);
+const localIPPorts = localIPs.map(ip => `${ip}:${options.port}`);
 
 const escapeUnicode = str => str.replace(/[\u00A0-\uffff]/gu, c => "\\u" + ("000" + c.charCodeAt().toString(16)).slice(-4));
 
-proxy.onError(function(ctx, err) {
+proxy.onError(function(_ctx, err) {
     switch (err.code) {
         case 'ERR_STREAM_DESTROYED':
         case 'ECONNRESET':
@@ -63,7 +62,7 @@ proxy.onError(function(ctx, err) {
             return;
 
         case 'EACCES':
-            console.error(`Permission was denied to use port ${program.port}.`);
+            console.error(`Permission was denied to use port ${options.port}.`);
             return;
 
         default:
@@ -82,11 +81,11 @@ proxy.onRequest(function(ctx, callback) {
             'Content-Type': 'application/x-x509-ca-cert',
             'Content-Disposition': 'attachment; filename=cert.pem',
             'Content-Transfer-Encoding': 'binary',
-            'Content-Length': fs.statSync(pemFile).size,
+            'Content-Length': statSync(pemFile).size,
             'Connection': 'keep-alive',
         });
         //ctx.proxyToClientResponse.end(fs.readFileSync(path.join(ROOT, 'certs', 'ca.pem')));
-        ctx.proxyToClientResponse.write(fs.readFileSync(pemFile));
+        ctx.proxyToClientResponse.write(readFileSync(pemFile));
         ctx.proxyToClientResponse.end();
 
         return;
@@ -94,19 +93,19 @@ proxy.onRequest(function(ctx, callback) {
     } else if (ctx.clientToProxyRequest.method === 'POST' && /tuya/.test(ctx.clientToProxyRequest.headers.host)) {
         ctx.use(Proxy.gunzip);
 
-        ctx.onRequestData(function(ctx, chunk, callback) {
+        ctx.onRequestData(function(_ctx, chunk, callback) {
             return callback(null, chunk);
         });
-        ctx.onRequestEnd(function(ctx, callback) {
+        ctx.onRequestEnd(function(_ctx, callback) {
             callback();
         });
 
         let chunks = [];
-        ctx.onResponseData(function(ctx, chunk, callback) {
+        ctx.onResponseData(function(_ctx, chunk, callback) {
             chunks.push(chunk);
             return callback(null, chunk);
         });
-        ctx.onResponseEnd(function(ctx, callback) {
+        ctx.onResponseEnd(function(_ctx, callback) {
             emitter.emit('tuya-config', Buffer.concat(chunks).toString());
             callback();
         });
@@ -152,7 +151,7 @@ emitter.on('tuya-config', body => {
         }
     });
 
-    if (program.schema) {
+    if (options.schema) {
         let schemas = [];
         data.result.some(data => {
             if (data && data.a === 'tuya.m.device.ref.info.my.list') {
@@ -188,20 +187,24 @@ emitter.on('tuya-config', body => {
     }, 5000);
 });
 
-proxy.listen({port: program.port, sslCaDir: ROOT}, err => {
+proxy.listen({ host: localIPs[0], port: options.port, sslCaDir: ROOT }, err => {
     if (err) {
         console.error('Error starting proxy: ' + err);
         return setTimeout(() => {
             process.exit(0);
         }, 5000);
     }
-    let {address, port} = proxy.httpServer.address();
-    if (address === '::' || address === '0.0.0.0') address = localIPs[0];
+    let { address, port } = proxy.httpServer.address();
 
-    QRCode.toString(`http://${address}:${port}/cert`, {type: 'terminal'}, function(err, url) {
+    const proxyUrl = `http://${address}:${port}/cert`;
+    QRCode.toString(proxyUrl, { type: 'terminal' }, function(err, url) {
+        if (err) {
+            console.error('Failed to generate QR code:', err);
+            return;
+        }
+
         console.log(url);
-        console.log('\nFollow the instructions on https://github.com/AMoo-Miki/homebridge-tuya-lan/wiki/Setup-Instructions');
-        console.log(`Proxy IP: ${address}`);
-        console.log(`Proxy Port: ${port}\n\n`);
+        console.log('Scan the QR code above to install the certificate on your device.');
+        console.log('If you can\'t scan the QR code, you can download the certificate from: ' + proxyUrl);
     })
 });
